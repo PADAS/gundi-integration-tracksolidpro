@@ -37,6 +37,7 @@ REGIONAL_URLS = [
     ("US",        "https://us-open.tracksolidpro.com/route/rest"),
     ("CN",        "https://open.tracksolidpro.com/route/rest"),
     ("10000track", "https://open.10000track.com/route/rest"),
+#    ("Tramigo", "https://dashcam.tramigovideo.com/route/rest")
 ]
 
 

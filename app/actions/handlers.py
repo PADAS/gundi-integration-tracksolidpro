@@ -3,6 +3,8 @@
 import logging
 from typing import List
 
+import httpx
+
 from app.actions.configurations import (
     PullDevicesConfig,
     PullObservationsConfig,
@@ -89,7 +91,9 @@ async def action_pull_observations(integration, action_config: PullObservationsC
 
     auth_config = get_auth_config(integration)
 
-    try:
+    target = auth_config.user_id
+    locations: List[dict] = []
+    for attempt in range(2):
         token = await get_cached_token(
             integration_id=integration_id,
             user_id=auth_config.user_id,
@@ -99,24 +103,24 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             base_url=auth_config.base_url,
             expires_in=auth_config.expires_in,
         )
-    except Exception as e:
-        await clear_token_cache(integration_id)
-        raise
-
-    target = auth_config.user_id
-    locations: List[dict] = []
-    try:
-        locations = await get_locations_by_account(
-            access_token=token,
-            target=target,
-            app_key=auth_config.app_key,
-            app_secret=auth_config.app_secret.get_secret_value(),
-            base_url=auth_config.base_url,
-        )
-    except RuntimeError as e:
-        if "token" in str(e).lower() or "401" in str(e):
+        try:
+            locations = await get_locations_by_account(
+                access_token=token,
+                target=target,
+                app_key=auth_config.app_key,
+                app_secret=auth_config.app_secret.get_secret_value(),
+                base_url=auth_config.base_url,
+            )
+            break
+        except (httpx.HTTPStatusError, RuntimeError) as e:
+            is_token_error = (
+                isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 401
+            ) or (
+                isinstance(e, RuntimeError) and ("token" in str(e).lower() or "401" in str(e))
+            )
+            if not is_token_error or attempt == 1:
+                raise
             await clear_token_cache(integration_id)
-        raise
 
     await log_action_activity(
         integration_id=integration_id,
