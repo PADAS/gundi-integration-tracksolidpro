@@ -73,7 +73,7 @@ def get_auth_config(integration):
     return TrackSolidProAuthConfig.parse_obj(auth_config.data)
 
 
-class PullDevicesConfig(PullActionConfiguration):
+class PullDevicesConfig(ExecutableActionMixin, PullActionConfiguration):
     """Configuration for pull_devices action."""
 
     target: str = pydantic.Field(
@@ -98,4 +98,25 @@ class PullObservationsConfig(PullActionConfiguration):
 
     ui_global_options = GlobalUISchemaOptions(
         order=["subject_type"],
+    )
+
+
+class PullTrackHistoryConfig(ExecutableActionMixin, PullActionConfiguration):
+    """Configuration for pull_track_history action."""
+
+    subject_type: str = FieldWithUIOptions(
+        "truck",
+        title="Subject type",
+        description="Subject type to set on observations (e.g. truck)",
+    )
+    lookback_minutes: int = pydantic.Field(
+        1440,
+        ge=10,
+        le=10080,
+        title="Lookback window (minutes)",
+        description="How far back to query track history on each run (default 1440 = 24 h)",
+    )
+
+    ui_global_options = GlobalUISchemaOptions(
+        order=["subject_type", "lookback_minutes"],
     )

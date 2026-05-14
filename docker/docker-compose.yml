@@ -5,7 +5,9 @@ services:
     container_name: api
     build:
       context: ../
-      dockerfile: ./Dockerfile
+      dockerfile: docker/Dockerfile
+    env_file:
+      - ../.env
     ports:
       - 8080:8080
     healthcheck:
