@@ -227,10 +227,9 @@ async def action_pull_track_history(integration, action_config: PullTrackHistory
                         logger.debug("Skipping track point missing lat/lng for imei=%s", imei)
                         continue
                     try:
-                        point_device_name = point.get("deviceName") or device_name
                         obs = location_to_observation(
-                            point,
-                            device_name=point_device_name,
+                            {**point, "imei": point.get("imei") or imei, "deviceName": point.get("deviceName") or device_name},
+                            device_name=device_name,
                             subject_type=subject_type,
                         )
                         observations.append(obs)
