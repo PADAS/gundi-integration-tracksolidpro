@@ -195,9 +195,9 @@ async def test_action_pull_track_history_sends_to_gundi(mocker, integration_with
     assert len(all_observations) == 4
     sources = {obs["source"] for obs in all_observations}
     assert sources == {"imei1", "imei2"}
-    # Verify gpsSpeed is mapped correctly
+    # Verify gpsSpeed is mapped to gps_speed_kmph
     imei1_obs = [o for o in all_observations if o["source"] == "imei1"]
-    assert imei1_obs[0]["additional"]["speed_kmph"] == 60.0
+    assert imei1_obs[0]["additional"]["gps_speed_kmph"] == 60.0
     assert imei1_obs[0]["additional"]["ignition"] == "ON"
     # Verify lookback_minutes is respected: window between begin and end should be ~45 min
     assert mock_get_tracks.call_count == 2

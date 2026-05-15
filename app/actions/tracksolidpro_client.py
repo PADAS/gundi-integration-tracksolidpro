@@ -404,13 +404,16 @@ def location_to_observation(loc: Dict[str, Any], device_name: str, subject_type:
         recorded_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S+00:00")
 
     additional = {}
-    # location.list uses "speed"; track.list uses "gpsSpeed"
-    speed_raw = loc.get("speed") if "speed" in loc else loc.get("gpsSpeed")
-    if speed_raw is not None:
+    if loc.get("speed") is not None:
         try:
-            additional["speed_kmph"] = float(speed_raw)
+            additional["speed_kmph"] = float(loc["speed"])
         except (TypeError, ValueError):
-            additional["speed_kmph"] = speed_raw
+            additional["speed_kmph"] = loc["speed"]
+    if loc.get("gpsSpeed") is not None:
+        try:
+            additional["gps_speed_kmph"] = float(loc["gpsSpeed"])
+        except (TypeError, ValueError):
+            additional["gps_speed_kmph"] = loc["gpsSpeed"]
     if loc.get("accStatus") is not None:
         additional["acc_status"] = str(loc["accStatus"])
     if loc.get("posType") is not None:
