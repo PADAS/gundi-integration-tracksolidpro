@@ -31,6 +31,7 @@ from gundi_core.events import LogLevel
 logger = logging.getLogger(__name__)
 
 OBSERVATION_BATCH_SIZE = 100
+TRACK_HISTORY_BATCH_SIZE = 200
 
 
 async def action_auth(integration, action_config: TrackSolidProAuthConfig):
@@ -187,7 +188,8 @@ async def action_pull_track_history(integration, action_config: PullTrackHistory
     end_time = now.strftime("%Y-%m-%d %H:%M:%S")
 
     devices: List[dict] = []
-    observations: List[dict] = []
+    total_points = 0
+    sent_total = 0
 
     for attempt in range(2):
         token = await get_cached_token(
@@ -207,7 +209,6 @@ async def action_pull_track_history(integration, action_config: PullTrackHistory
                 app_secret=auth_config.app_secret.get_secret_value(),
                 base_url=auth_config.base_url,
             )
-            observations = []
             for device in devices:
                 imei = device.get("imei")
                 if not imei:
@@ -222,6 +223,7 @@ async def action_pull_track_history(integration, action_config: PullTrackHistory
                     app_secret=auth_config.app_secret.get_secret_value(),
                     base_url=auth_config.base_url,
                 )
+                device_observations = []
                 for point in tracks:
                     if point.get("lat") is None or point.get("lng") is None:
                         logger.debug("Skipping track point missing lat/lng for imei=%s", imei)
@@ -232,9 +234,16 @@ async def action_pull_track_history(integration, action_config: PullTrackHistory
                             device_name=device_name,
                             subject_type=subject_type,
                         )
-                        observations.append(obs)
+                        device_observations.append(obs)
                     except (ValueError, TypeError) as e:
                         logger.debug("Skipping invalid track point for imei=%s: %s", imei, e)
+                total_points += len(device_observations)
+                for batch in generate_batches(device_observations, TRACK_HISTORY_BATCH_SIZE):
+                    await send_observations_to_gundi(
+                        observations=list(batch),
+                        integration_id=integration.id,
+                    )
+                    sent_total += len(batch)
             break
         except (httpx.HTTPStatusError, RuntimeError) as e:
             is_token_error = (
@@ -246,24 +255,16 @@ async def action_pull_track_history(integration, action_config: PullTrackHistory
                 raise
             await clear_token_cache(integration_id)
 
-    sent_total = 0
-    for batch in generate_batches(observations, OBSERVATION_BATCH_SIZE):
-        await send_observations_to_gundi(
-            observations=list(batch),
-            integration_id=integration.id,
-        )
-        sent_total += len(batch)
-
     await log_action_activity(
         integration_id=integration_id,
         action_id=action_id,
         title="Fetched track history from TrackSolidPro",
         level=LogLevel.INFO,
-        data={"devices_queried": len(devices), "track_points_fetched": len(observations), "observations_sent": sent_total},
+        data={"devices_queried": len(devices), "track_points_fetched": total_points, "observations_sent": sent_total},
     )
 
     return {
         "devices_queried": len(devices),
-        "track_points_fetched": len(observations),
+        "track_points_fetched": total_points,
         "observations_sent": sent_total,
     }
