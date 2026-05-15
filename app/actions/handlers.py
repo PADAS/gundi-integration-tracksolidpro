@@ -171,7 +171,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     }
 
 
-@crontab_schedule("0 0,12 * * *")
+@crontab_schedule("0 0 * * *")
 @activity_logger()
 async def action_pull_track_history(integration, action_config: PullTrackHistoryConfig):
     """Pull GPS track history for all devices (jimi.device.track.list) and send to Gundi."""
