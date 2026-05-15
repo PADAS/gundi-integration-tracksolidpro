@@ -1,6 +1,7 @@
 """Tests for TrackSolidPro action handlers."""
 
 import pytest
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
 from app.actions.configurations import (
@@ -152,7 +153,7 @@ async def test_action_pull_track_history_sends_to_gundi(mocker, integration_with
             ]
         ),
     )
-    mocker.patch(
+    mock_get_tracks = mocker.patch(
         "app.actions.handlers.get_device_tracks",
         AsyncMock(
             return_value=[
@@ -181,24 +182,28 @@ async def test_action_pull_track_history_sends_to_gundi(mocker, integration_with
     )
     mock_send = AsyncMock(return_value=[])
     mocker.patch("app.actions.handlers.send_observations_to_gundi", mock_send)
-    mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
     mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
 
     config = PullTrackHistoryConfig(subject_type="vehicle", lookback_minutes=45)
     result = await action_pull_track_history(integration_with_auth, config)
 
-    # 2 devices × 2 points each = 4 observations
+    # 2 devices × 2 points each = 4 observations, sent per-device (2 send calls)
     assert result["devices_queried"] == 2
     assert result["observations_sent"] == 4
-    assert mock_send.call_count == 1
-    observations = mock_send.call_args.kwargs["observations"]
-    assert len(observations) == 4
-    sources = {obs["source"] for obs in observations}
+    assert mock_send.call_count == 2
+    all_observations = [obs for call in mock_send.call_args_list for obs in call.kwargs["observations"]]
+    assert len(all_observations) == 4
+    sources = {obs["source"] for obs in all_observations}
     assert sources == {"imei1", "imei2"}
     # Verify gpsSpeed is mapped correctly
-    imei1_obs = [o for o in observations if o["source"] == "imei1"]
+    imei1_obs = [o for o in all_observations if o["source"] == "imei1"]
     assert imei1_obs[0]["additional"]["speed_kmph"] == 60.0
     assert imei1_obs[0]["additional"]["ignition"] == "ON"
+    # Verify lookback_minutes is respected: window between begin and end should be ~45 min
+    assert mock_get_tracks.call_count == 2
+    begin = datetime.strptime(mock_get_tracks.call_args_list[0].kwargs["begin_time"], "%Y-%m-%d %H:%M:%S")
+    end = datetime.strptime(mock_get_tracks.call_args_list[0].kwargs["end_time"], "%Y-%m-%d %H:%M:%S")
+    assert abs((end - begin).total_seconds() - 45 * 60) < 5
 
 
 @pytest.mark.asyncio

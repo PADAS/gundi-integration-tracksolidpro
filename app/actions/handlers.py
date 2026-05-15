@@ -255,14 +255,6 @@ async def action_pull_track_history(integration, action_config: PullTrackHistory
                 raise
             await clear_token_cache(integration_id)
 
-    await log_action_activity(
-        integration_id=integration_id,
-        action_id=action_id,
-        title="Fetched track history from TrackSolidPro",
-        level=LogLevel.INFO,
-        data={"devices_queried": len(devices), "track_points_fetched": total_points, "observations_sent": sent_total},
-    )
-
     return {
         "devices_queried": len(devices),
         "track_points_fetched": total_points,
