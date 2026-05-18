@@ -1,5 +1,6 @@
 """Tests for TrackSolidPro action handlers."""
 
+import httpx
 import pytest
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
@@ -231,4 +232,41 @@ async def test_action_pull_track_history_skips_points_without_coords(mocker, int
     config = PullTrackHistoryConfig(subject_type="vehicle", lookback_minutes=45)
     result = await action_pull_track_history(integration_with_auth, config)
 
+    assert result["observations_sent"] == 1
+
+
+@pytest.mark.asyncio
+async def test_action_pull_track_history_retries_list_devices_on_401(mocker, integration_with_auth):
+    """A 401 from list_devices clears the token cache and retries; already-sent observations are NOT re-sent."""
+    response_401 = MagicMock(spec=httpx.Response)
+    response_401.status_code = 401
+    error_401 = httpx.HTTPStatusError("401", request=MagicMock(), response=response_401)
+
+    mock_get_token = mocker.patch(
+        "app.actions.handlers.get_cached_token",
+        AsyncMock(return_value="access-tok"),
+    )
+    mock_clear_cache = mocker.patch("app.actions.handlers.clear_token_cache", AsyncMock())
+    mock_list_devices = mocker.patch(
+        "app.actions.handlers.list_devices",
+        AsyncMock(side_effect=[error_401, [{"imei": "imei1", "deviceName": "D1"}]]),
+    )
+    mocker.patch(
+        "app.actions.handlers.get_device_tracks",
+        AsyncMock(return_value=[{"lat": 1.0, "lng": 2.0, "gpsTime": "2024-01-15 10:00:00"}]),
+    )
+    mock_send = AsyncMock(return_value=[])
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", mock_send)
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+
+    config = PullTrackHistoryConfig(subject_type="vehicle", lookback_minutes=45)
+    result = await action_pull_track_history(integration_with_auth, config)
+
+    # Token was refreshed and list_devices retried once
+    assert mock_get_token.call_count == 2
+    assert mock_clear_cache.call_count == 1
+    assert mock_list_devices.call_count == 2
+
+    # Observations sent exactly once — no duplicate sends from the retry
+    assert mock_send.call_count == 1
     assert result["observations_sent"] == 1
