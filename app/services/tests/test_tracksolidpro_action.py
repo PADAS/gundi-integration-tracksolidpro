@@ -262,11 +262,58 @@ async def test_action_pull_track_history_retries_list_devices_on_401(mocker, int
     config = PullTrackHistoryConfig(subject_type="vehicle", lookback_minutes=45)
     result = await action_pull_track_history(integration_with_auth, config)
 
-    # Token was refreshed and list_devices retried once
-    assert mock_get_token.call_count == 2
+    # Token was refreshed for list_devices retry (2 calls) + 1 more for get_device_tracks = 3
+    assert mock_get_token.call_count == 3
     assert mock_clear_cache.call_count == 1
     assert mock_list_devices.call_count == 2
 
     # Observations sent exactly once — no duplicate sends from the retry
     assert mock_send.call_count == 1
     assert result["observations_sent"] == 1
+
+
+@pytest.mark.asyncio
+async def test_action_pull_track_history_retries_get_device_tracks_on_401(mocker, integration_with_auth):
+    """A 401 from get_device_tracks refreshes the token and retries for that device only.
+
+    Verifies that:
+    - The failed device is retried with a fresh token (not skipped).
+    - Observations for the failed device are sent exactly once (no duplicates).
+    - Observations for the preceding device that succeeded are not re-sent.
+    - The refreshed token is reused for subsequent devices.
+    """
+    response_401 = MagicMock(spec=httpx.Response)
+    response_401.status_code = 401
+    error_401 = httpx.HTTPStatusError("401", request=MagicMock(), response=response_401)
+
+    track_point = {"lat": 1.0, "lng": 2.0, "gpsTime": "2024-01-15 10:00:00"}
+
+    mocker.patch("app.actions.handlers.get_cached_token", AsyncMock(return_value="tok"))
+    mock_clear_cache = mocker.patch("app.actions.handlers.clear_token_cache", AsyncMock())
+    mocker.patch(
+        "app.actions.handlers.list_devices",
+        AsyncMock(return_value=[
+            {"imei": "imei1", "deviceName": "D1"},
+            {"imei": "imei2", "deviceName": "D2"},
+        ]),
+    )
+    # imei1 succeeds, imei2 gets a 401 then succeeds on retry
+    mock_get_tracks = mocker.patch(
+        "app.actions.handlers.get_device_tracks",
+        AsyncMock(side_effect=[[track_point], error_401, [track_point]]),
+    )
+    mock_send = AsyncMock(return_value=[])
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", mock_send)
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+
+    config = PullTrackHistoryConfig(subject_type="vehicle", lookback_minutes=45)
+    result = await action_pull_track_history(integration_with_auth, config)
+
+    # get_device_tracks called 3 times: once for imei1, twice for imei2 (401 + retry)
+    assert mock_get_tracks.call_count == 3
+    # Token cache cleared once for the imei2 401
+    assert mock_clear_cache.call_count == 1
+    # Each device sends exactly once — no duplicate sends
+    assert mock_send.call_count == 2
+    assert result["devices_queried"] == 2
+    assert result["observations_sent"] == 2
