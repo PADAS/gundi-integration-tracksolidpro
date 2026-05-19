@@ -1,6 +1,7 @@
-"""TrackSolidPro actions: auth, pull_devices, pull_observations."""
+"""TrackSolidPro actions: auth, pull_devices, pull_observations, pull_track_history."""
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import List
 
 import httpx
@@ -8,12 +9,14 @@ import httpx
 from app.actions.configurations import (
     PullDevicesConfig,
     PullObservationsConfig,
+    PullTrackHistoryConfig,
     TrackSolidProAuthConfig,
     get_auth_config,
 )
 from app.actions.tracksolidpro_client import (
     clear_token_cache,
     get_cached_token,
+    get_device_tracks,
     get_locations_by_account,
     get_token,
     list_devices,
@@ -28,6 +31,32 @@ from gundi_core.events import LogLevel
 logger = logging.getLogger(__name__)
 
 OBSERVATION_BATCH_SIZE = 100
+TRACK_HISTORY_BATCH_SIZE = 200
+
+
+async def _with_token_retry(integration_id, auth_config, api_call):
+    """Get a cached token, call api_call(token), and retry once on 401."""
+    for attempt in range(2):
+        token = await get_cached_token(
+            integration_id=integration_id,
+            user_id=auth_config.user_id,
+            password=auth_config.password.get_secret_value(),
+            app_key=auth_config.app_key,
+            app_secret=auth_config.app_secret.get_secret_value(),
+            base_url=auth_config.base_url,
+            expires_in=auth_config.expires_in,
+        )
+        try:
+            return token, await api_call(token)
+        except (httpx.HTTPStatusError, RuntimeError) as e:
+            is_token_error = (
+                isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 401
+            ) or (
+                isinstance(e, RuntimeError) and ("token" in str(e).lower() or "401" in str(e))
+            )
+            if not is_token_error or attempt == 1:
+                raise
+            await clear_token_cache(integration_id)
 
 
 async def action_auth(integration, action_config: TrackSolidProAuthConfig):
@@ -92,35 +121,17 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     auth_config = get_auth_config(integration)
 
     target = auth_config.user_id
-    locations: List[dict] = []
-    for attempt in range(2):
-        token = await get_cached_token(
-            integration_id=integration_id,
-            user_id=auth_config.user_id,
-            password=auth_config.password.get_secret_value(),
+    _, locations = await _with_token_retry(
+        integration_id,
+        auth_config,
+        lambda tok: get_locations_by_account(
+            access_token=tok,
+            target=target,
             app_key=auth_config.app_key,
             app_secret=auth_config.app_secret.get_secret_value(),
             base_url=auth_config.base_url,
-            expires_in=auth_config.expires_in,
-        )
-        try:
-            locations = await get_locations_by_account(
-                access_token=token,
-                target=target,
-                app_key=auth_config.app_key,
-                app_secret=auth_config.app_secret.get_secret_value(),
-                base_url=auth_config.base_url,
-            )
-            break
-        except (httpx.HTTPStatusError, RuntimeError) as e:
-            is_token_error = (
-                isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 401
-            ) or (
-                isinstance(e, RuntimeError) and ("token" in str(e).lower() or "401" in str(e))
-            )
-            if not is_token_error or attempt == 1:
-                raise
-            await clear_token_cache(integration_id)
+        ),
+    )
 
     await log_action_activity(
         integration_id=integration_id,
@@ -164,5 +175,93 @@ async def action_pull_observations(integration, action_config: PullObservationsC
 
     return {
         "locations_fetched": len(locations),
+        "observations_sent": sent_total,
+    }
+
+
+@crontab_schedule("0 0 * * *")
+@activity_logger()
+async def action_pull_track_history(integration, action_config: PullTrackHistoryConfig):
+    """Pull GPS track history for all devices (jimi.device.track.list) and send to Gundi.
+
+    Note: pull_track_history uses a different JIMI API endpoint (jimi.device.track.list) than pull_observations
+    (jimi.device.location.list), so their data sets are not necessarily identical even for the same time window.
+    The risk of processing the same observation twice has been reviewed and accepted — any actual duplicates
+    would be deduplicated by Gundi and ER.
+    """
+    integration_id = str(integration.id)
+    auth_config = get_auth_config(integration)
+    subject_type = (action_config.subject_type or "truck").strip() or "truck"
+
+    now = datetime.now(timezone.utc)
+    # JIMI API expects UTC timestamps in "%Y-%m-%d %H:%M:%S" format
+    begin_time = (now - timedelta(minutes=action_config.lookback_minutes)).strftime("%Y-%m-%d %H:%M:%S")
+    end_time = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    total_points = 0
+    sent_total = 0
+
+    token, devices = await _with_token_retry(
+        integration_id,
+        auth_config,
+        lambda tok: list_devices(
+            access_token=tok,
+            target=auth_config.user_id,
+            app_key=auth_config.app_key,
+            app_secret=auth_config.app_secret.get_secret_value(),
+            base_url=auth_config.base_url,
+        ),
+    )
+
+    for device in devices:
+        imei = device.get("imei")
+        if not imei:
+            continue
+        device_name = device.get("deviceName") or str(imei)
+        # Retry once on 401 (token may expire mid-run) and update the token for
+        # subsequent devices. Any other error is logged and the device is skipped
+        # so a single failure doesn't abort the rest of the run.
+        try:
+            token, tracks = await _with_token_retry(
+                integration_id,
+                auth_config,
+                lambda tok: get_device_tracks(
+                    access_token=tok,
+                    imei=str(imei),
+                    begin_time=begin_time,
+                    end_time=end_time,
+                    app_key=auth_config.app_key,
+                    app_secret=auth_config.app_secret.get_secret_value(),
+                    base_url=auth_config.base_url,
+                ),
+            )
+        except Exception as e:
+            logger.warning("Skipping device imei=%s — failed to fetch tracks: %s", imei, e)
+            continue
+        device_observations = []
+        for point in tracks:
+            if point.get("lat") is None or point.get("lng") is None:
+                logger.debug("Skipping track point missing lat/lng for imei=%s", imei)
+                continue
+            try:
+                obs = location_to_observation(
+                    {**point, "imei": point.get("imei") or imei, "deviceName": point.get("deviceName") or device_name},
+                    device_name=device_name,
+                    subject_type=subject_type,
+                )
+                device_observations.append(obs)
+            except (ValueError, TypeError) as e:
+                logger.debug("Skipping invalid track point for imei=%s: %s", imei, e)
+        total_points += len(device_observations)
+        for batch in generate_batches(device_observations, TRACK_HISTORY_BATCH_SIZE):
+            await send_observations_to_gundi(
+                observations=list(batch),
+                integration_id=integration.id,
+            )
+            sent_total += len(batch)
+
+    return {
+        "devices_queried": len(devices),
+        "track_points_processed": total_points,
         "observations_sent": sent_total,
     }

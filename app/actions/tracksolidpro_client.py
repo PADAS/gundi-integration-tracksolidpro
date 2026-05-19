@@ -350,10 +350,36 @@ async def get_locations_by_imeis(
     return result if isinstance(result, list) else [result]
 
 
+async def get_device_tracks(
+    access_token: str,
+    imei: str,
+    begin_time: str,
+    end_time: str,
+    app_key: str,
+    app_secret: str,
+    base_url: str,
+    map_type: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Get track history for a single device (jimi.device.track.list). Returns list of track points."""
+    params = {
+        "access_token": access_token,
+        "imei": imei,
+        "begin_time": begin_time,
+        "end_time": end_time,
+    }
+    if map_type is not None:
+        params["map_type"] = map_type
+    data = await _request_async(base_url, "jimi.device.track.list", params, app_key, app_secret)
+    result = data.get("result")
+    if result is None:
+        return []
+    return result if isinstance(result, list) else [result]
+
+
 def location_to_observation(loc: Dict[str, Any], device_name: str, subject_type: str = "vehicle") -> Dict[str, Any]:
     """
     Map one JIMI location item to Gundi observation dict.
-    JIMI fields: imei, deviceName, lat, lng, gpsTime, speed, accStatus, posType, direction, etc.
+    Handles both location.list fields (speed) and track.list fields (gpsSpeed, ignition, satellite).
     """
     from datetime import datetime
 
@@ -383,6 +409,11 @@ def location_to_observation(loc: Dict[str, Any], device_name: str, subject_type:
             additional["speed_kmph"] = float(loc["speed"])
         except (TypeError, ValueError):
             additional["speed_kmph"] = loc["speed"]
+    if loc.get("gpsSpeed") is not None:
+        try:
+            additional["gps_speed_kmph"] = float(loc["gpsSpeed"])
+        except (TypeError, ValueError):
+            additional["gps_speed_kmph"] = loc["gpsSpeed"]
     if loc.get("accStatus") is not None:
         additional["acc_status"] = str(loc["accStatus"])
     if loc.get("posType") is not None:
@@ -391,6 +422,10 @@ def location_to_observation(loc: Dict[str, Any], device_name: str, subject_type:
         additional["direction"] = str(loc["direction"])
     if loc.get("status") is not None:
         additional["status"] = str(loc["status"])
+    if loc.get("ignition") is not None:
+        additional["ignition"] = str(loc["ignition"])
+    if loc.get("satellite") is not None:
+        additional["satellite"] = str(loc["satellite"])
 
     return {
         "source": str(imei),
