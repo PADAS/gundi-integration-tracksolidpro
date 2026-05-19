@@ -184,11 +184,12 @@ async def action_pull_observations(integration, action_config: PullObservationsC
 async def action_pull_track_history(integration, action_config: PullTrackHistoryConfig):
     """Pull GPS track history for all devices (jimi.device.track.list) and send to Gundi.
 
-    Points in the lookback window may overlap with pull_observations; duplicates are deduplicated by Gundi and ER.
+    Note: pull_track_history uses a different JIMI API endpoint (jimi.device.track.list) than pull_observations
+    (jimi.device.location.list), so their data sets are not necessarily identical even for the same time window.
+    The risk of processing the same observation twice has been reviewed and accepted — any actual duplicates
+    would be deduplicated by Gundi and ER.
     """
     integration_id = str(integration.id)
-    action_id = "pull_track_history"
-
     auth_config = get_auth_config(integration)
     subject_type = (action_config.subject_type or "truck").strip() or "truck"
 
@@ -200,9 +201,6 @@ async def action_pull_track_history(integration, action_config: PullTrackHistory
     total_points = 0
     sent_total = 0
 
-    # Retry boundary covers only list_devices (the call most likely to 401).
-    # Per-device fetching and sending runs outside so a mid-run token expiry
-    # cannot cause already-delivered observations to be re-sent.
     token, devices = await _with_token_retry(
         integration_id,
         auth_config,
@@ -220,15 +218,26 @@ async def action_pull_track_history(integration, action_config: PullTrackHistory
         if not imei:
             continue
         device_name = device.get("deviceName") or str(imei)
-        tracks = await get_device_tracks(
-            access_token=token,
-            imei=str(imei),
-            begin_time=begin_time,
-            end_time=end_time,
-            app_key=auth_config.app_key,
-            app_secret=auth_config.app_secret.get_secret_value(),
-            base_url=auth_config.base_url,
-        )
+        # Retry once on 401 (token may expire mid-run) and update the token for
+        # subsequent devices. Any other error is logged and the device is skipped
+        # so a single failure doesn't abort the rest of the run.
+        try:
+            token, tracks = await _with_token_retry(
+                integration_id,
+                auth_config,
+                lambda tok: get_device_tracks(
+                    access_token=tok,
+                    imei=str(imei),
+                    begin_time=begin_time,
+                    end_time=end_time,
+                    app_key=auth_config.app_key,
+                    app_secret=auth_config.app_secret.get_secret_value(),
+                    base_url=auth_config.base_url,
+                ),
+            )
+        except Exception as e:
+            logger.warning("Skipping device imei=%s — failed to fetch tracks: %s", imei, e)
+            continue
         device_observations = []
         for point in tracks:
             if point.get("lat") is None or point.get("lng") is None:
@@ -253,6 +262,6 @@ async def action_pull_track_history(integration, action_config: PullTrackHistory
 
     return {
         "devices_queried": len(devices),
-        "track_points_fetched": total_points,
+        "track_points_processed": total_points,
         "observations_sent": sent_total,
     }
