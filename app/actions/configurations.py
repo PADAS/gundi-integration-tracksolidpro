@@ -1,10 +1,13 @@
 """TrackSolidPro action configurations and get_auth_config helper."""
 
+from typing import Optional
+
 import pydantic
 
 from app.actions.core import (
     AuthActionConfiguration,
     ExecutableActionMixin,
+    InternalActionConfiguration,
     PullActionConfiguration,
 )
 from app.services.errors import ConfigurationNotFound
@@ -120,3 +123,20 @@ class PullTrackHistoryConfig(ExecutableActionMixin, PullActionConfiguration):
     ui_global_options = GlobalUISchemaOptions(
         order=["subject_type", "lookback_minutes"],
     )
+
+
+class PullDeviceTrackHistoryConfig(InternalActionConfiguration):
+    """One device's share of a pull_track_history run.
+
+    Built by action_pull_track_history and delivered as config_overrides on a
+    RunIntegrationAction command, one per device. Internal: never shown in the
+    portal or registered in Gundi. The window is fixed by the parent so every
+    device covers the same range however long its command waits in the queue.
+    """
+
+    imei: str
+    device_name: Optional[str] = None
+    subject_type: str = "truck"
+    # JIMI UTC timestamps, "%Y-%m-%d %H:%M:%S"
+    begin_time: str
+    end_time: str

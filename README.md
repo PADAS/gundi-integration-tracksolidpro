@@ -53,6 +53,23 @@ Configuration:
 |---|---|---|
 | `subject_type` | `truck` | Subject type applied to all observations (e.g. `truck`, `vehicle`) |
 
+### `pull_track_history` (runs daily at 00:00 UTC)
+
+Fans out one `pull_device_track_history` run per device. It lists the account's devices, computes a single time window (`now - lookback_minutes` to `now`), and publishes one `RunIntegrationAction` command per IMEI in one batch. It does not fetch or send track points itself: doing that serially across every device for a 24 h window exceeded the runner's 9-minute execution cap (`MAX_ACTION_EXECUTION_TIME`).
+
+Configuration:
+
+| Field | Default | Description |
+|---|---|---|
+| `subject_type` | `truck` | Subject type applied to all observations |
+| `lookback_minutes` | `1440` | How far back to query track history on each run (10 to 10080) |
+
+Requires `INTEGRATION_COMMANDS_TOPIC` (derived from `INTEGRATION_TYPE_SLUG` by default) so the per-device commands can be published. Set `TRIGGER_ACTIONS_ALWAYS_SYNC=true` locally to run the per-device actions inline instead.
+
+### `pull_device_track_history` (internal)
+
+Pulls GPS track history for one device via `jimi.device.track.list` for the window it was given and sends the points to Gundi in batches of 200. Triggered only by `pull_track_history`; not shown in the portal and not registered in Gundi. A failure here affects that device's run only.
+
 ### `pull_devices`
 
 Lists all devices registered to the account. Useful for verifying connectivity and discovering device IMEIs.

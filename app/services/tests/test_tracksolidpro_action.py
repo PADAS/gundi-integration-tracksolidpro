@@ -8,10 +8,17 @@ from unittest.mock import AsyncMock, MagicMock
 from app.actions.configurations import (
     TrackSolidProAuthConfig,
     PullObservationsConfig,
+    PullDeviceTrackHistoryConfig,
     PullTrackHistoryConfig,
     get_auth_config,
 )
-from app.actions.handlers import action_auth, action_pull_observations, action_pull_track_history
+from app.actions.handlers import (
+    TRACK_HISTORY_BATCH_SIZE,
+    action_auth,
+    action_pull_device_track_history,
+    action_pull_observations,
+    action_pull_track_history,
+)
 from app.services.errors import ConfigurationNotFound
 
 
@@ -139,181 +146,212 @@ async def test_action_pull_observations_sends_to_gundi(mocker, integration_with_
 
 
 @pytest.mark.asyncio
-async def test_action_pull_track_history_sends_to_gundi(mocker, integration_with_auth):
-    """action_pull_track_history lists devices, fetches tracks per IMEI, sends all points to Gundi."""
-    mocker.patch(
-        "app.actions.handlers.get_cached_token",
-        AsyncMock(return_value="access-tok"),
-    )
-    mocker.patch(
-        "app.actions.handlers.list_devices",
-        AsyncMock(
-            return_value=[
-                {"imei": "imei1", "deviceName": "D1"},
-                {"imei": "imei2", "deviceName": "D2"},
-            ]
-        ),
-    )
-    mock_get_tracks = mocker.patch(
-        "app.actions.handlers.get_device_tracks",
-        AsyncMock(
-            return_value=[
-                {
-                    "lat": 22.5,
-                    "lng": 113.9,
-                    "gpsTime": "2024-01-15 10:00:00",
-                    "gpsSpeed": "60",
-                    "direction": "90",
-                    "posType": "1",
-                    "ignition": "ON",
-                    "accStatus": "ON",
-                },
-                {
-                    "lat": 22.6,
-                    "lng": 114.0,
-                    "gpsTime": "2024-01-15 10:05:00",
-                    "gpsSpeed": "0",
-                    "direction": "0",
-                    "posType": "1",
-                    "ignition": "OFF",
-                    "accStatus": "OFF",
-                },
-            ]
-        ),
-    )
-    mock_send = AsyncMock(return_value=[])
-    mocker.patch("app.actions.handlers.send_observations_to_gundi", mock_send)
-    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
-
-    config = PullTrackHistoryConfig(subject_type="vehicle", lookback_minutes=45)
-    result = await action_pull_track_history(integration_with_auth, config)
-
-    # 2 devices × 2 points each = 4 observations, sent per-device (2 send calls)
-    assert result["devices_queried"] == 2
-    assert result["observations_sent"] == 4
-    assert mock_send.call_count == 2
-    all_observations = [obs for call in mock_send.call_args_list for obs in call.kwargs["observations"]]
-    assert len(all_observations) == 4
-    sources = {obs["source"] for obs in all_observations}
-    assert sources == {"imei1", "imei2"}
-    # Verify gpsSpeed is mapped to gps_speed_kmph
-    imei1_obs = [o for o in all_observations if o["source"] == "imei1"]
-    assert imei1_obs[0]["additional"]["gps_speed_kmph"] == 60.0
-    assert imei1_obs[0]["additional"]["ignition"] == "ON"
-    # Verify lookback_minutes is respected: window between begin and end should be ~45 min
-    assert mock_get_tracks.call_count == 2
-    begin = datetime.strptime(mock_get_tracks.call_args_list[0].kwargs["begin_time"], "%Y-%m-%d %H:%M:%S")
-    end = datetime.strptime(mock_get_tracks.call_args_list[0].kwargs["end_time"], "%Y-%m-%d %H:%M:%S")
-    assert abs((end - begin).total_seconds() - 45 * 60) < 5
-
-
-@pytest.mark.asyncio
-async def test_action_pull_track_history_skips_points_without_coords(mocker, integration_with_auth):
-    """action_pull_track_history skips track points that are missing lat or lng."""
-    mocker.patch("app.actions.handlers.get_cached_token", AsyncMock(return_value="tok"))
-    mocker.patch(
-        "app.actions.handlers.list_devices",
-        AsyncMock(return_value=[{"imei": "imei1", "deviceName": "D1"}]),
-    )
-    mocker.patch(
-        "app.actions.handlers.get_device_tracks",
-        AsyncMock(
-            return_value=[
-                {"lat": None, "lng": 113.9, "gpsTime": "2024-01-15 10:00:00"},
-                {"lat": 22.5, "lng": 114.0, "gpsTime": "2024-01-15 10:05:00"},
-            ]
-        ),
-    )
-    mock_send = AsyncMock(return_value=[])
-    mocker.patch("app.actions.handlers.send_observations_to_gundi", mock_send)
-    mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
-    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
-
-    config = PullTrackHistoryConfig(subject_type="vehicle", lookback_minutes=45)
-    result = await action_pull_track_history(integration_with_auth, config)
-
-    assert result["observations_sent"] == 1
-
-
-@pytest.mark.asyncio
-async def test_action_pull_track_history_retries_list_devices_on_401(mocker, integration_with_auth):
-    """A 401 from list_devices clears the token cache and retries; already-sent observations are NOT re-sent."""
+def _http_401():
     response_401 = MagicMock(spec=httpx.Response)
     response_401.status_code = 401
-    error_401 = httpx.HTTPStatusError("401", request=MagicMock(), response=response_401)
+    return httpx.HTTPStatusError("401", request=MagicMock(), response=response_401)
 
-    mock_get_token = mocker.patch(
-        "app.actions.handlers.get_cached_token",
-        AsyncMock(return_value="access-tok"),
-    )
-    mock_clear_cache = mocker.patch("app.actions.handlers.clear_token_cache", AsyncMock())
-    mock_list_devices = mocker.patch(
-        "app.actions.handlers.list_devices",
-        AsyncMock(side_effect=[error_401, [{"imei": "imei1", "deviceName": "D1"}]]),
-    )
-    mocker.patch(
-        "app.actions.handlers.get_device_tracks",
-        AsyncMock(return_value=[{"lat": 1.0, "lng": 2.0, "gpsTime": "2024-01-15 10:00:00"}]),
-    )
-    mock_send = AsyncMock(return_value=[])
-    mocker.patch("app.actions.handlers.send_observations_to_gundi", mock_send)
-    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
 
-    config = PullTrackHistoryConfig(subject_type="vehicle", lookback_minutes=45)
-    result = await action_pull_track_history(integration_with_auth, config)
-
-    # Token was refreshed for list_devices retry (2 calls) + 1 more for get_device_tracks = 3
-    assert mock_get_token.call_count == 3
-    assert mock_clear_cache.call_count == 1
-    assert mock_list_devices.call_count == 2
-
-    # Observations sent exactly once — no duplicate sends from the retry
-    assert mock_send.call_count == 1
-    assert result["observations_sent"] == 1
+# --- pull_track_history: the daily fan-out ---------------------------------
 
 
 @pytest.mark.asyncio
-async def test_action_pull_track_history_retries_get_device_tracks_on_401(mocker, integration_with_auth):
-    """A 401 from get_device_tracks refreshes the token and retries for that device only.
+async def test_action_pull_track_history_fans_out_one_action_per_device(mocker, integration_with_auth):
+    """The daily action lists devices and triggers one pull_device_track_history per IMEI.
 
-    Verifies that:
-    - The failed device is retried with a fresh token (not skipped).
-    - Observations for the failed device are sent exactly once (no duplicates).
-    - Observations for the preceding device that succeeded are not re-sent.
-    - The refreshed token is reused for subsequent devices.
+    It must not fetch tracks or send observations itself: that work is what
+    used to overrun the runner's execution cap when done serially.
     """
-    response_401 = MagicMock(spec=httpx.Response)
-    response_401.status_code = 401
-    error_401 = httpx.HTTPStatusError("401", request=MagicMock(), response=response_401)
-
-    track_point = {"lat": 1.0, "lng": 2.0, "gpsTime": "2024-01-15 10:00:00"}
-
-    mocker.patch("app.actions.handlers.get_cached_token", AsyncMock(return_value="tok"))
-    mock_clear_cache = mocker.patch("app.actions.handlers.clear_token_cache", AsyncMock())
+    mocker.patch("app.actions.handlers.get_cached_token", AsyncMock(return_value="access-tok"))
     mocker.patch(
         "app.actions.handlers.list_devices",
         AsyncMock(return_value=[
             {"imei": "imei1", "deviceName": "D1"},
             {"imei": "imei2", "deviceName": "D2"},
+            {"deviceName": "no-imei"},
         ]),
     )
-    # imei1 succeeds, imei2 gets a 401 then succeeds on retry
-    mock_get_tracks = mocker.patch(
-        "app.actions.handlers.get_device_tracks",
-        AsyncMock(side_effect=[[track_point], error_401, [track_point]]),
-    )
-    mock_send = AsyncMock(return_value=[])
-    mocker.patch("app.actions.handlers.send_observations_to_gundi", mock_send)
+    mock_get_tracks = mocker.patch("app.actions.handlers.get_device_tracks", AsyncMock())
+    mock_send = mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock())
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_actions", AsyncMock(return_value={"messageIds": ["1", "2"]}))
     mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
 
     config = PullTrackHistoryConfig(subject_type="vehicle", lookback_minutes=45)
     result = await action_pull_track_history(integration_with_auth, config)
 
-    # get_device_tracks called 3 times: once for imei1, twice for imei2 (401 + retry)
-    assert mock_get_tracks.call_count == 3
-    # Token cache cleared once for the imei2 401
+    assert result == {"devices_queried": 3, "devices_triggered": 2}
+    assert not mock_get_tracks.called
+    assert not mock_send.called
+
+    mock_trigger.assert_called_once()
+    assert mock_trigger.call_args.kwargs["integration_id"] == str(integration_with_auth.id)
+    assert mock_trigger.call_args.kwargs["action_id"] == "pull_device_track_history"
+    configs = mock_trigger.call_args.kwargs["configs"]
+    assert [c.imei for c in configs] == ["imei1", "imei2"]
+    assert [c.device_name for c in configs] == ["D1", "D2"]
+    assert all(isinstance(c, PullDeviceTrackHistoryConfig) for c in configs)
+    assert all(c.subject_type == "vehicle" for c in configs)
+    # One window computed once by the parent and shared by every child, so
+    # children delayed in the queue do not drift to different ranges.
+    assert len({(c.begin_time, c.end_time) for c in configs}) == 1
+    begin = datetime.strptime(configs[0].begin_time, "%Y-%m-%d %H:%M:%S")
+    end = datetime.strptime(configs[0].end_time, "%Y-%m-%d %H:%M:%S")
+    assert abs((end - begin).total_seconds() - 45 * 60) < 5
+
+
+@pytest.mark.asyncio
+async def test_action_pull_track_history_retries_list_devices_on_401(mocker, integration_with_auth):
+    """A 401 from list_devices clears the token cache and retries once."""
+    mock_get_token = mocker.patch("app.actions.handlers.get_cached_token", AsyncMock(return_value="access-tok"))
+    mock_clear_cache = mocker.patch("app.actions.handlers.clear_token_cache", AsyncMock())
+    mock_list_devices = mocker.patch(
+        "app.actions.handlers.list_devices",
+        AsyncMock(side_effect=[_http_401(), [{"imei": "imei1", "deviceName": "D1"}]]),
+    )
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_actions", AsyncMock())
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+
+    config = PullTrackHistoryConfig(subject_type="vehicle", lookback_minutes=45)
+    result = await action_pull_track_history(integration_with_auth, config)
+
+    assert mock_get_token.call_count == 2
     assert mock_clear_cache.call_count == 1
-    # Each device sends exactly once — no duplicate sends
+    assert mock_list_devices.call_count == 2
+    assert mock_trigger.call_count == 1
+    assert result["devices_triggered"] == 1
+
+
+def test_pull_device_track_history_is_an_internal_action():
+    """The per-device action is discovered by the runner but not registered in Gundi."""
+    from app.actions import action_handlers
+    from app.actions.core import InternalActionConfiguration
+
+    handler, config_model, _ = action_handlers["pull_device_track_history"]
+    assert handler is action_pull_device_track_history
+    assert issubclass(config_model, InternalActionConfiguration)
+
+
+# --- pull_device_track_history: one device per run --------------------------
+
+
+def _device_config(**overrides):
+    values = dict(
+        imei="imei1",
+        device_name="D1",
+        subject_type="vehicle",
+        begin_time="2024-01-15 09:15:00",
+        end_time="2024-01-15 10:00:00",
+    )
+    values.update(overrides)
+    return PullDeviceTrackHistoryConfig(**values)
+
+
+@pytest.mark.asyncio
+async def test_action_pull_device_track_history_sends_to_gundi_in_batches(mocker, integration_with_auth):
+    """Fetches the device's tracks for the given window and sends them in batches of TRACK_HISTORY_BATCH_SIZE."""
+    mocker.patch("app.actions.handlers.get_cached_token", AsyncMock(return_value="access-tok"))
+    points = [
+        {
+            "lat": 22.5,
+            "lng": 113.9 + i * 0.001,
+            "gpsTime": "2024-01-15 10:00:00",
+            "gpsSpeed": "60",
+            "direction": "90",
+            "posType": "1",
+            "ignition": "ON",
+            "accStatus": "ON",
+        }
+        for i in range(TRACK_HISTORY_BATCH_SIZE + 50)
+    ]
+    mock_get_tracks = mocker.patch("app.actions.handlers.get_device_tracks", AsyncMock(return_value=points))
+    mock_send = mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+
+    result = await action_pull_device_track_history(integration_with_auth, _device_config())
+
+    assert result == {
+        "imei": "imei1",
+        "track_points_processed": TRACK_HISTORY_BATCH_SIZE + 50,
+        "observations_sent": TRACK_HISTORY_BATCH_SIZE + 50,
+    }
+    mock_get_tracks.assert_called_once()
+    assert mock_get_tracks.call_args.kwargs["imei"] == "imei1"
+    assert mock_get_tracks.call_args.kwargs["begin_time"] == "2024-01-15 09:15:00"
+    assert mock_get_tracks.call_args.kwargs["end_time"] == "2024-01-15 10:00:00"
+
     assert mock_send.call_count == 2
-    assert result["devices_queried"] == 2
-    assert result["observations_sent"] == 2
+    sizes = [len(call.kwargs["observations"]) for call in mock_send.call_args_list]
+    assert sizes == [TRACK_HISTORY_BATCH_SIZE, 50]
+    assert all(call.kwargs["integration_id"] == integration_with_auth.id for call in mock_send.call_args_list)
+    first = mock_send.call_args_list[0].kwargs["observations"][0]
+    assert first["source"] == "imei1"
+    assert first["subject_type"] == "vehicle"
+    assert first["additional"]["gps_speed_kmph"] == 60.0
+    assert first["additional"]["ignition"] == "ON"
+
+
+@pytest.mark.asyncio
+async def test_action_pull_device_track_history_skips_points_without_coords(mocker, integration_with_auth):
+    mocker.patch("app.actions.handlers.get_cached_token", AsyncMock(return_value="tok"))
+    mocker.patch(
+        "app.actions.handlers.get_device_tracks",
+        AsyncMock(return_value=[
+            {"lat": None, "lng": 113.9, "gpsTime": "2024-01-15 10:00:00"},
+            {"lat": 22.5, "lng": 114.0, "gpsTime": "2024-01-15 10:05:00"},
+        ]),
+    )
+    mock_send = mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+
+    result = await action_pull_device_track_history(integration_with_auth, _device_config())
+
+    assert result["track_points_processed"] == 1
+    assert result["observations_sent"] == 1
+    assert mock_send.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_action_pull_device_track_history_with_no_points_sends_nothing(mocker, integration_with_auth):
+    mocker.patch("app.actions.handlers.get_cached_token", AsyncMock(return_value="tok"))
+    mocker.patch("app.actions.handlers.get_device_tracks", AsyncMock(return_value=[]))
+    mock_send = mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock())
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+
+    result = await action_pull_device_track_history(integration_with_auth, _device_config())
+
+    assert result["observations_sent"] == 0
+    assert not mock_send.called
+
+
+@pytest.mark.asyncio
+async def test_action_pull_device_track_history_retries_get_device_tracks_on_401(mocker, integration_with_auth):
+    """A 401 from get_device_tracks refreshes the token and retries; observations are sent exactly once."""
+    track_point = {"lat": 1.0, "lng": 2.0, "gpsTime": "2024-01-15 10:00:00"}
+    mocker.patch("app.actions.handlers.get_cached_token", AsyncMock(return_value="tok"))
+    mock_clear_cache = mocker.patch("app.actions.handlers.clear_token_cache", AsyncMock())
+    mock_get_tracks = mocker.patch(
+        "app.actions.handlers.get_device_tracks",
+        AsyncMock(side_effect=[_http_401(), [track_point]]),
+    )
+    mock_send = mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+
+    result = await action_pull_device_track_history(integration_with_auth, _device_config())
+
+    assert mock_get_tracks.call_count == 2
+    assert mock_clear_cache.call_count == 1
+    assert mock_send.call_count == 1
+    assert result["observations_sent"] == 1
+
+
+@pytest.mark.asyncio
+async def test_action_pull_device_track_history_propagates_fetch_errors(mocker, integration_with_auth):
+    """A non-auth failure fails this device's run (the runner logs it); it is not swallowed."""
+    mocker.patch("app.actions.handlers.get_cached_token", AsyncMock(return_value="tok"))
+    mocker.patch("app.actions.handlers.get_device_tracks", AsyncMock(side_effect=RuntimeError("JIMI code=9999")))
+    mock_send = mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock())
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+
+    with pytest.raises(RuntimeError, match="9999"):
+        await action_pull_device_track_history(integration_with_auth, _device_config())
+    assert not mock_send.called

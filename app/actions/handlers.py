@@ -1,4 +1,4 @@
-"""TrackSolidPro actions: auth, pull_devices, pull_observations, pull_track_history."""
+"""TrackSolidPro actions: auth, pull_devices, pull_observations, pull_track_history, pull_device_track_history."""
 
 import logging
 from datetime import datetime, timedelta, timezone
@@ -7,6 +7,7 @@ from typing import List
 import httpx
 
 from app.actions.configurations import (
+    PullDeviceTrackHistoryConfig,
     PullDevicesConfig,
     PullObservationsConfig,
     PullTrackHistoryConfig,
@@ -23,7 +24,7 @@ from app.actions.tracksolidpro_client import (
     location_to_observation,
 )
 from app.services.activity_logger import activity_logger, log_action_activity
-from app.services.action_scheduler import crontab_schedule
+from app.services.action_scheduler import crontab_schedule, trigger_actions
 from app.services.gundi import send_observations_to_gundi
 from app.services.utils import generate_batches
 from gundi_core.events import LogLevel
@@ -182,7 +183,12 @@ async def action_pull_observations(integration, action_config: PullObservationsC
 @crontab_schedule("0 0 * * *")
 @activity_logger()
 async def action_pull_track_history(integration, action_config: PullTrackHistoryConfig):
-    """Pull GPS track history for all devices (jimi.device.track.list) and send to Gundi.
+    """Fan out one pull_device_track_history run per device.
+
+    Lists the account's devices and publishes one RunIntegrationAction command
+    per IMEI, all in one batch. The fetch-and-send work happens in the
+    per-device runs so each stays well inside the runner's execution cap;
+    doing it serially here for a 24 h window across every device overran it.
 
     Note: pull_track_history uses a different JIMI API endpoint (jimi.device.track.list) than pull_observations
     (jimi.device.location.list), so their data sets are not necessarily identical even for the same time window.
@@ -198,10 +204,7 @@ async def action_pull_track_history(integration, action_config: PullTrackHistory
     begin_time = (now - timedelta(minutes=action_config.lookback_minutes)).strftime("%Y-%m-%d %H:%M:%S")
     end_time = now.strftime("%Y-%m-%d %H:%M:%S")
 
-    total_points = 0
-    sent_total = 0
-
-    token, devices = await _with_token_retry(
+    _, devices = await _with_token_retry(
         integration_id,
         auth_config,
         lambda tok: list_devices(
@@ -213,55 +216,87 @@ async def action_pull_track_history(integration, action_config: PullTrackHistory
         ),
     )
 
+    device_configs = []
     for device in devices:
         imei = device.get("imei")
         if not imei:
+            logger.debug("Skipping device without imei: %s", device)
             continue
-        device_name = device.get("deviceName") or str(imei)
-        # Retry once on 401 (token may expire mid-run) and update the token for
-        # subsequent devices. Any other error is logged and the device is skipped
-        # so a single failure doesn't abort the rest of the run.
-        try:
-            token, tracks = await _with_token_retry(
-                integration_id,
-                auth_config,
-                lambda tok: get_device_tracks(
-                    access_token=tok,
-                    imei=str(imei),
-                    begin_time=begin_time,
-                    end_time=end_time,
-                    app_key=auth_config.app_key,
-                    app_secret=auth_config.app_secret.get_secret_value(),
-                    base_url=auth_config.base_url,
-                ),
+        device_configs.append(
+            PullDeviceTrackHistoryConfig(
+                imei=str(imei),
+                device_name=device.get("deviceName") or str(imei),
+                subject_type=subject_type,
+                begin_time=begin_time,
+                end_time=end_time,
             )
-        except Exception as e:
-            logger.warning("Skipping device imei=%s — failed to fetch tracks: %s", imei, e)
-            continue
-        device_observations = []
-        for point in tracks:
-            if point.get("lat") is None or point.get("lng") is None:
-                logger.debug("Skipping track point missing lat/lng for imei=%s", imei)
-                continue
-            try:
-                obs = location_to_observation(
-                    {**point, "imei": point.get("imei") or imei, "deviceName": point.get("deviceName") or device_name},
-                    device_name=device_name,
-                    subject_type=subject_type,
-                )
-                device_observations.append(obs)
-            except (ValueError, TypeError) as e:
-                logger.debug("Skipping invalid track point for imei=%s: %s", imei, e)
-        total_points += len(device_observations)
-        for batch in generate_batches(device_observations, TRACK_HISTORY_BATCH_SIZE):
-            await send_observations_to_gundi(
-                observations=list(batch),
-                integration_id=integration.id,
-            )
-            sent_total += len(batch)
+        )
+
+    await trigger_actions(
+        integration_id=integration_id,
+        action_id="pull_device_track_history",
+        configs=device_configs,
+    )
 
     return {
         "devices_queried": len(devices),
-        "track_points_processed": total_points,
+        "devices_triggered": len(device_configs),
+    }
+
+
+@activity_logger()
+async def action_pull_device_track_history(integration, action_config: PullDeviceTrackHistoryConfig):
+    """Pull GPS track history for one device (jimi.device.track.list) and send it to Gundi.
+
+    Triggered by action_pull_track_history, one command per device. Errors
+    other than an expired token propagate: the runner logs the failure for
+    this device alone and the other devices' runs are unaffected.
+    """
+    integration_id = str(integration.id)
+    auth_config = get_auth_config(integration)
+    imei = action_config.imei
+    device_name = action_config.device_name or imei
+    subject_type = (action_config.subject_type or "truck").strip() or "truck"
+
+    _, tracks = await _with_token_retry(
+        integration_id,
+        auth_config,
+        lambda tok: get_device_tracks(
+            access_token=tok,
+            imei=imei,
+            begin_time=action_config.begin_time,
+            end_time=action_config.end_time,
+            app_key=auth_config.app_key,
+            app_secret=auth_config.app_secret.get_secret_value(),
+            base_url=auth_config.base_url,
+        ),
+    )
+
+    observations = []
+    for point in tracks:
+        if point.get("lat") is None or point.get("lng") is None:
+            logger.debug("Skipping track point missing lat/lng for imei=%s", imei)
+            continue
+        try:
+            obs = location_to_observation(
+                {**point, "imei": point.get("imei") or imei, "deviceName": point.get("deviceName") or device_name},
+                device_name=device_name,
+                subject_type=subject_type,
+            )
+            observations.append(obs)
+        except (ValueError, TypeError) as e:
+            logger.debug("Skipping invalid track point for imei=%s: %s", imei, e)
+
+    sent_total = 0
+    for batch in generate_batches(observations, TRACK_HISTORY_BATCH_SIZE):
+        await send_observations_to_gundi(
+            observations=list(batch),
+            integration_id=integration.id,
+        )
+        sent_total += len(batch)
+
+    return {
+        "imei": imei,
+        "track_points_processed": len(observations),
         "observations_sent": sent_total,
     }
