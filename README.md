@@ -66,6 +66,8 @@ Configuration:
 
 Requires `INTEGRATION_COMMANDS_TOPIC` (derived from `INTEGRATION_TYPE_SLUG` by default) so the per-device commands can be published. Set `TRIGGER_ACTIONS_ALWAYS_SYNC=true` locally to run the per-device actions inline instead.
 
+A per-device run that fails for a transient reason (provider unreachable or 5xx, rate limited, Gundi 5xx, the runner's execution cap) answers PubSub with a non-2xx so the command is redelivered with backoff; failures a retry cannot fix (bad configuration, rejected credentials, provider 4xx) are acked. This needs `PROCESS_PUBSUB_MESSAGES_IN_BACKGROUND` left off, since background mode acks on receipt.
+
 ### `pull_device_track_history` (internal)
 
 Pulls GPS track history for one device via `jimi.device.track.list` for the window it was given and sends the points to Gundi in batches of 200. Triggered only by `pull_track_history`; not shown in the portal and not registered in Gundi. A failure here affects that device's run only.
