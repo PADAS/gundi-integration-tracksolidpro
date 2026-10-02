@@ -86,6 +86,10 @@ Configuration:
 
 Access tokens are cached in Redis via `IntegrationStateManager`. The cache TTL is set to `expires_in - 60` seconds so the token is refreshed proactively before it expires. On authentication failure the cache is cleared and a fresh token is obtained on the next run.
 
+## Activity-log redaction
+
+The configuration attached to every activity-log event is redacted before publishing (`app/services/redaction.py`): values under secret-looking keys (`password`, `token`, `api_key`, `secret`, ...) and fields a config model declares as `SecretStr`, `Field(format="password")` or `UIOptions(widget="password")` are replaced with `**********`, matched by field name or alias and at any depth of nested models. Declare secrets that way and they never reach the portal's activity log in clear, whatever their name.
+
 ## Development utilities
 
 **Single-URL token test** — mirrors exactly what the integration sends:
